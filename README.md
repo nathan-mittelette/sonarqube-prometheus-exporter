@@ -103,17 +103,6 @@ sonarqube_bugs{domain="Reliability",project_key="my-project",project_name="My Pr
 sonarqube_code_smells{domain="Maintainability",project_key="my-project",project_name="My Project"} 23
 ```
 
-## Prometheus Configuration
-
-Add the following to your `prometheus.yml`:
-
-```yaml
-scrape_configs:
-  - job_name: 'sonarqube'
-    static_configs:
-      - targets: ['localhost:9090']
-```
-
 ## Development
 
 ### Prerequisites
@@ -253,8 +242,8 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 
 ## License
 
-MIT License
+Apache License 2.0
 
 ## Author
 
-Created by Axopen
+Created by nathan-mittelette
