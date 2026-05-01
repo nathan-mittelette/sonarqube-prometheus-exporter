@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/axopen/sonarqube-prometheus-exporter/internal/sonarqube"
@@ -16,15 +17,17 @@ import (
 type Collector struct {
 	client          *sonarqube.Client
 	projectInfo     *prometheus.Desc
-	metricDescs     map[string]*prometheus.Desc
 	branchInfo      *prometheus.Desc
 	pullRequestInfo *prometheus.Desc
-	mu              sync.RWMutex
+
+	// mu protects metricDescs and cache together: both are reset on each refresh
+	// and read on each Collect, so they share a single lock to avoid deadlocks.
+	mu          sync.RWMutex
+	metricDescs map[string]*prometheus.Desc
+	cache       *MetricsCache
 
 	// Async collection state
 	config              Config
-	cache               *MetricsCache
-	cacheMu             sync.RWMutex
 	refreshCtx          context.Context
 	refreshCancel       context.CancelFunc
 	refreshWg           sync.WaitGroup
@@ -119,6 +122,11 @@ func (c *Collector) CacheReady() <-chan struct{} {
 	return c.cacheReady
 }
 
+// IsAsyncMode reports whether the collector is running in async refresh mode
+func (c *Collector) IsAsyncMode() bool {
+	return c.config.RefreshInterval > 0
+}
+
 // refreshLoop runs the background refresh loop
 func (c *Collector) refreshLoop() {
 	defer c.refreshWg.Done()
@@ -139,12 +147,21 @@ func (c *Collector) refreshLoop() {
 	}
 }
 
-// refreshMetrics fetches all metrics asynchronously and updates the cache
+// maxConcurrentFetches limits the number of simultaneous SonarQube API calls
+// to avoid overwhelming the server when there are many projects/branches/PRs.
+const maxConcurrentFetches = 20
+
+// refreshMetrics fetches all data from SonarQube and updates the cache.
+// Called by the background goroutine in async mode, or directly in Collect in sync mode.
 func (c *Collector) refreshMetrics() {
 	startTime := time.Now()
-	c.cacheMu.Lock()
+	mode := "async"
+	if c.config.RefreshInterval == 0 {
+		mode = "sync"
+	}
+	c.mu.Lock()
 	c.lastRefreshTime = startTime
-	c.cacheMu.Unlock()
+	c.mu.Unlock()
 
 	// Create a new cache to avoid partial updates
 	newCache := &MetricsCache{
@@ -162,143 +179,198 @@ func (c *Collector) refreshMetrics() {
 	// Fetch metrics
 	metrics, err := c.client.GetMetrics()
 	if err != nil {
-		c.cacheMu.Lock()
+		c.mu.Lock()
 		c.lastRefreshError = err
 		c.lastRefreshDuration = time.Since(startTime)
-		c.cacheMu.Unlock()
-		log.Printf("Error refreshing metrics: %v", err)
+		c.mu.Unlock()
+		log.Printf("[%s] Error refreshing metrics: %v", mode, err)
 		return
 	}
 	newCache.Metrics = metrics
 	newCache.NumericMetricKeys = c.getNumericMetricKeys(metrics)
+	log.Printf("[%s] Found %d numeric metrics", mode, len(newCache.NumericMetricKeys))
 
 	// Fetch projects
 	projects, err := c.client.GetProjects()
 	if err != nil {
-		c.cacheMu.Lock()
+		c.mu.Lock()
 		c.lastRefreshError = err
 		c.lastRefreshDuration = time.Since(startTime)
-		c.cacheMu.Unlock()
-		log.Printf("Error refreshing projects: %v", err)
+		c.mu.Unlock()
+		log.Printf("[%s] Error refreshing projects: %v", mode, err)
 		return
 	}
 	newCache.Projects = projects
+	log.Printf("[%s] Found %d projects — starting phase 1 (measures%s%s)",
+		mode,
+		len(projects),
+		map[bool]string{true: ", branches", false: ""}[c.config.CollectBranches],
+		map[bool]string{true: ", pull requests", false: ""}[c.config.CollectPullRequests],
+	)
 
-	// Fetch project measures with proper synchronization
-	var wg sync.WaitGroup
+	// sem limits concurrent SonarQube API calls across all goroutines
+	sem := make(chan struct{}, maxConcurrentFetches)
+
+	// Pre-collect all fetch tasks so we can call wg.Add before launching goroutines.
+	// This avoids the data race where wg.Add is called from within a running goroutine
+	// after wg.Wait() might have already returned.
+	type branchTask struct {
+		projectKey string
+		branch     sonarqube.Branch
+	}
+	type prTask struct {
+		projectKey string
+		pr         sonarqube.PullRequest
+	}
+
+	var (
+		wg           sync.WaitGroup
+		branchTasks  []branchTask
+		prTasks      []prTask
+		branchTaskMu sync.Mutex
+		prTaskMu     sync.Mutex
+		doneProjects atomic.Int32
+	)
+	total := int32(len(projects))
+
+	// Phase 1: fetch project measures + branches/PRs lists concurrently
 	for _, project := range projects {
 		wg.Add(1)
 		go func(p sonarqube.Component) {
 			defer wg.Done()
+			sem <- struct{}{}
 			measures, err := c.client.GetProjectMeasures(p.Key, newCache.NumericMetricKeys)
+			<-sem
+			n := doneProjects.Add(1)
 			if err != nil {
-				log.Printf("Error fetching measures for project %s: %v", p.Key, err)
-				return
+				log.Printf("[%s] [%d/%d] Error fetching measures for project %s: %v", mode, n, total, p.Key, err)
+			} else {
+				log.Printf("[%s] [%d/%d] Fetched measures for project %s", mode, n, total, p.Key)
+				newCacheMu.Lock()
+				newCache.ProjectMeasures[p.Key] = measures
+				newCacheMu.Unlock()
 			}
-
-			// Safe write to newCache
-			newCacheMu.Lock()
-			newCache.ProjectMeasures[p.Key] = measures
-			newCacheMu.Unlock()
 		}(project)
-	}
 
-	// Fetch branches if enabled
-	if c.config.CollectBranches {
-		for _, project := range projects {
+		if c.config.CollectBranches {
 			wg.Add(1)
 			go func(p sonarqube.Component) {
 				defer wg.Done()
+				sem <- struct{}{}
 				branches, err := c.client.GetProjectBranches(p.Key)
+				<-sem
 				if err != nil {
-					log.Printf("Error fetching branches for project %s: %v", p.Key, err)
+					log.Printf("[%s] Error fetching branches for project %s: %v", mode, p.Key, err)
 					return
 				}
-
-				// Safe write to newCache
 				newCacheMu.Lock()
 				newCache.Branches[p.Key] = branches
-				// Initialize branch measures map
 				newCache.BranchMeasures[p.Key] = make(map[string][]sonarqube.Measure)
 				newCacheMu.Unlock()
 
-				// Fetch measures for each branch
-				for _, branch := range branches {
-					wg.Add(1)
-					go func(projectKey string, b sonarqube.Branch) {
-						defer wg.Done()
-						measures, err := c.client.GetBranchMeasures(projectKey, b.Key, newCache.NumericMetricKeys)
-						if err != nil {
-							log.Printf("Error fetching measures for branch %s:%s: %v", projectKey, b.Key, err)
-							return
-						}
-
-						// Safe write to nested map
-						newCacheMu.Lock()
-						if _, exists := newCache.BranchMeasures[projectKey]; !exists {
-							newCache.BranchMeasures[projectKey] = make(map[string][]sonarqube.Measure)
-						}
-						newCache.BranchMeasures[projectKey][b.Key] = measures
-						newCacheMu.Unlock()
-					}(p.Key, branch)
+				branchTaskMu.Lock()
+				for _, b := range branches {
+					branchTasks = append(branchTasks, branchTask{projectKey: p.Key, branch: b})
 				}
+				branchTaskMu.Unlock()
 			}(project)
 		}
-	}
 
-	// Fetch pull requests if enabled
-	if c.config.CollectPullRequests {
-		for _, project := range projects {
+		if c.config.CollectPullRequests {
 			wg.Add(1)
 			go func(p sonarqube.Component) {
 				defer wg.Done()
+				sem <- struct{}{}
 				prs, err := c.client.GetProjectPullRequests(p.Key)
+				<-sem
 				if err != nil {
-					log.Printf("Error fetching pull requests for project %s: %v", p.Key, err)
+					log.Printf("[%s] Error fetching pull requests for project %s: %v", mode, p.Key, err)
 					return
 				}
-
-				// Safe write to newCache
 				newCacheMu.Lock()
 				newCache.PullRequests[p.Key] = prs
-				// Initialize PR measures map
 				newCache.PRMeasures[p.Key] = make(map[string][]sonarqube.Measure)
 				newCacheMu.Unlock()
 
-				// Fetch measures for each pull request
+				prTaskMu.Lock()
 				for _, pr := range prs {
-					wg.Add(1)
-					go func(projectKey string, pr sonarqube.PullRequest) {
-						defer wg.Done()
-						measures, err := c.client.GetPullRequestMeasures(projectKey, pr.Key, newCache.NumericMetricKeys)
-						if err != nil {
-							log.Printf("Error fetching measures for pull request %s:%s: %v", projectKey, pr.Key, err)
-							return
-						}
-
-						// Safe write to nested map
-						newCacheMu.Lock()
-						if _, exists := newCache.PRMeasures[projectKey]; !exists {
-							newCache.PRMeasures[projectKey] = make(map[string][]sonarqube.Measure)
-						}
-						newCache.PRMeasures[projectKey][pr.Key] = measures
-						newCacheMu.Unlock()
-					}(p.Key, pr)
+					prTasks = append(prTasks, prTask{projectKey: p.Key, pr: pr})
 				}
+				prTaskMu.Unlock()
 			}(project)
 		}
+	}
+	wg.Wait()
+
+	// Phase 2: fetch branch and PR measures now that all lists are known
+	if len(branchTasks) > 0 || len(prTasks) > 0 {
+		log.Printf("[%s] Phase 1 done — starting phase 2 (%d branches, %d pull requests)", mode, len(branchTasks), len(prTasks))
+	}
+
+	var (
+		doneBranches  atomic.Int32
+		donePRs       atomic.Int32
+		totalBranches = int32(len(branchTasks))
+		totalPRs      = int32(len(prTasks))
+	)
+
+	for _, task := range branchTasks {
+		wg.Add(1)
+		go func(t branchTask) {
+			defer wg.Done()
+			sem <- struct{}{}
+			measures, err := c.client.GetBranchMeasures(t.projectKey, t.branch.Name, newCache.NumericMetricKeys)
+			<-sem
+			n := doneBranches.Add(1)
+			if err != nil {
+				log.Printf("[%s] [branch %d/%d] Error fetching measures for %s:%s: %v", mode, n, totalBranches, t.projectKey, t.branch.Name, err)
+				return
+			}
+			log.Printf("[%s] [branch %d/%d] Fetched measures for %s:%s", mode, n, totalBranches, t.projectKey, t.branch.Name)
+			newCacheMu.Lock()
+			if _, exists := newCache.BranchMeasures[t.projectKey]; !exists {
+				newCache.BranchMeasures[t.projectKey] = make(map[string][]sonarqube.Measure)
+			}
+			newCache.BranchMeasures[t.projectKey][t.branch.Name] = measures
+			newCacheMu.Unlock()
+		}(task)
+	}
+	for _, task := range prTasks {
+		wg.Add(1)
+		go func(t prTask) {
+			defer wg.Done()
+			sem <- struct{}{}
+			measures, err := c.client.GetPullRequestMeasures(t.projectKey, t.pr.Key, newCache.NumericMetricKeys)
+			<-sem
+			n := donePRs.Add(1)
+			if err != nil {
+				log.Printf("[%s] [PR %d/%d] Error fetching measures for %s:%s: %v", mode, n, totalPRs, t.projectKey, t.pr.Key, err)
+				return
+			}
+			log.Printf("[%s] [PR %d/%d] Fetched measures for %s:%s", mode, n, totalPRs, t.projectKey, t.pr.Key)
+			newCacheMu.Lock()
+			if _, exists := newCache.PRMeasures[t.projectKey]; !exists {
+				newCache.PRMeasures[t.projectKey] = make(map[string][]sonarqube.Measure)
+			}
+			newCache.PRMeasures[t.projectKey][t.pr.Key] = measures
+			newCacheMu.Unlock()
+		}(task)
 	}
 
 	// Wait for all fetches to complete
 	wg.Wait()
 
-	// Update cache atomically
-	c.cacheMu.Lock()
+	// Swap cache and reset metric descriptors atomically under a single lock.
+	// metricDescs must be cleared so descriptors are rebuilt from the new metric
+	// definitions — stale descriptors cause Prometheus to reject metrics whose
+	// help text changed between refreshes.
+	c.mu.Lock()
 	c.cache = newCache
+	c.metricDescs = make(map[string]*prometheus.Desc)
 	c.lastRefreshError = nil
 	c.lastRefreshDuration = time.Since(startTime)
 	c.lastRefreshTime = startTime
-	c.cacheMu.Unlock()
+	c.mu.Unlock()
 
 	// Close cacheReady channel on first successful population
 	select {
@@ -308,7 +380,7 @@ func (c *Collector) refreshMetrics() {
 		close(c.cacheReady)
 	}
 
-	log.Printf("Metrics cache refreshed successfully in %v", c.lastRefreshDuration)
+	log.Printf("[%s] Metrics cache refreshed successfully in %v", mode, c.lastRefreshDuration)
 }
 
 // Describe sends the descriptors of each metric to the provided channel
@@ -322,34 +394,23 @@ func (c *Collector) Describe(ch chan<- *prometheus.Desc) {
 	}
 }
 
-// Collect is called by the Prometheus registry when collecting metrics
+// Collect is called by the Prometheus registry when collecting metrics.
+// In async mode the cache is pre-populated by the background goroutine, so we
+// just read from it. In sync mode we refresh the cache on-demand before reading,
+// which means the same parallel fetch logic is used in both cases.
 func (c *Collector) Collect(ch chan<- prometheus.Metric) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	// If async refresh is enabled, use cached data
-	if c.config.RefreshInterval > 0 {
-		// Check if cache is ready
-		select {
-		case <-c.cacheReady:
-			// Cache is populated, serve from cache
-			c.collectFromCache(ch)
-		default:
-			// Cache not ready yet, fall back to synchronous collection
-			// This ensures metrics are available even during initial startup
-			c.collectSync(ch)
-		}
-		return
+	if c.config.RefreshInterval == 0 {
+		c.refreshMetrics()
 	}
 
-	// Otherwise, fetch synchronously (old behavior)
-	c.collectSync(ch)
+	c.collectFromCache(ch)
 }
 
-// collectFromCache collects metrics from the cache
+// collectFromCache collects metrics from the cache.
+// mu protects both cache and metricDescs.
 func (c *Collector) collectFromCache(ch chan<- prometheus.Metric) {
-	c.cacheMu.RLock()
-	defer c.cacheMu.RUnlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
 	if c.cache == nil {
 		return
@@ -393,16 +454,16 @@ func (c *Collector) collectFromCache(ch chan<- prometheus.Metric) {
 					1,
 					projectKey,
 					projectName,
-					branch.Key,
+					branch.Name,
 					branch.Name,
 					isMain,
 				)
 
 				// Export branch measures
 				if branchMeasures, exists := c.cache.BranchMeasures[projectKey]; exists {
-					if measures, exists := branchMeasures[branch.Key]; exists {
+					if measures, exists := branchMeasures[branch.Name]; exists {
 						for _, measure := range measures {
-							c.exportMeasure(ch, projectKey, projectName, measure, c.cache.Metrics, "branch", branch.Key)
+							c.exportMeasure(ch, projectKey, projectName, measure, c.cache.Metrics, "branch", branch.Name)
 						}
 					}
 				}
@@ -424,7 +485,7 @@ func (c *Collector) collectFromCache(ch chan<- prometheus.Metric) {
 					projectKey,
 					projectName,
 					pr.Key,
-					pr.Status,
+					pr.Status.QualityGateStatus,
 					pr.Branch,
 					pr.Target,
 				)
@@ -435,127 +496,6 @@ func (c *Collector) collectFromCache(ch chan<- prometheus.Metric) {
 						for _, measure := range measures {
 							c.exportMeasure(ch, projectKey, projectName, measure, c.cache.Metrics, "pull_request", pr.Key)
 						}
-					}
-				}
-			}
-		}
-	}
-}
-
-// collectSync collects metrics synchronously (old behavior)
-func (c *Collector) collectSync(ch chan<- prometheus.Metric) {
-	// Fetch available metrics from SonarQube
-	metrics, err := c.client.GetMetrics()
-	if err != nil {
-		log.Printf("Error fetching metrics: %v", err)
-		return
-	}
-
-	// Build list of numeric metric keys to fetch
-	numericMetricKeys := c.getNumericMetricKeys(metrics)
-
-	// Fetch all projects
-	projects, err := c.client.GetProjects()
-	if err != nil {
-		log.Printf("Error fetching projects: %v", err)
-		return
-	}
-
-	// For each project, fetch its measures and export them
-	for _, project := range projects {
-		// Export project info metric
-		ch <- prometheus.MustNewConstMetric(
-			c.projectInfo,
-			prometheus.GaugeValue,
-			1,
-			project.Key,
-			project.Name,
-			project.Qualifier,
-			project.Visibility,
-		)
-
-		// Fetch measures for this project
-		measures, err := c.client.GetProjectMeasures(project.Key, numericMetricKeys)
-		if err != nil {
-			log.Printf("Error fetching measures for project %s: %v", project.Key, err)
-			continue
-		}
-
-		// Export each measure
-		for _, measure := range measures {
-			c.exportMeasure(ch, project.Key, project.Name, measure, metrics, "project")
-		}
-
-		// Fetch branches if enabled
-		if c.config.CollectBranches {
-			branches, err := c.client.GetProjectBranches(project.Key)
-			if err != nil {
-				log.Printf("Error fetching branches for project %s: %v", project.Key, err)
-			} else {
-				for _, branch := range branches {
-					// Export branch info metric
-					isMain := "false"
-					if branch.IsMain {
-						isMain = "true"
-					}
-
-					ch <- prometheus.MustNewConstMetric(
-						c.branchInfo,
-						prometheus.GaugeValue,
-						1,
-						project.Key,
-						project.Name,
-						branch.Key,
-						branch.Name,
-						isMain,
-					)
-
-					// Fetch measures for this branch
-					branchMeasures, err := c.client.GetBranchMeasures(project.Key, branch.Key, numericMetricKeys)
-					if err != nil {
-						log.Printf("Error fetching measures for branch %s:%s: %v", project.Key, branch.Key, err)
-						continue
-					}
-
-					// Export each branch measure
-					for _, measure := range branchMeasures {
-						c.exportMeasure(ch, project.Key, project.Name, measure, metrics, "branch", branch.Key)
-					}
-				}
-			}
-		}
-
-		// Fetch pull requests if enabled
-		if c.config.CollectPullRequests {
-			prs, err := c.client.GetProjectPullRequests(project.Key)
-			if err != nil {
-				log.Printf("Error fetching pull requests for project %s: %v", project.Key, err)
-			} else {
-				for _, pr := range prs {
-					// Export pull request info metric
-					// Note: pr.Title is omitted from labels to avoid high cardinality
-					ch <- prometheus.MustNewConstMetric(
-						c.pullRequestInfo,
-						prometheus.GaugeValue,
-						1,
-						project.Key,
-						project.Name,
-						pr.Key,
-						pr.Status,
-						pr.Branch,
-						pr.Target,
-					)
-
-					// Fetch measures for this pull request
-					prMeasures, err := c.client.GetPullRequestMeasures(project.Key, pr.Key, numericMetricKeys)
-					if err != nil {
-						log.Printf("Error fetching measures for pull request %s:%s: %v", project.Key, pr.Key, err)
-						continue
-					}
-
-					// Export each pull request measure
-					for _, measure := range prMeasures {
-						c.exportMeasure(ch, project.Key, project.Name, measure, metrics, "pull_request", pr.Key)
 					}
 				}
 			}
@@ -663,12 +603,14 @@ func (c *Collector) getOrCreateMetricDesc(metric *sonarqube.Metric, entityType s
 		return desc
 	}
 
-	// Sanitize metric name for Prometheus
+	// Build the Prometheus metric name.
+	// For branch/PR metrics we use a suffix (_branch, _pull_request) rather than a prefix
+	// to avoid collisions with SonarQube metric keys that already start with "branch_"
+	// (e.g. SonarQube "branch_coverage" would collide with "coverage" measured on a branch
+	// if both were prefixed with "sonarqube_branch_").
 	metricName := "sonarqube_" + sanitizeMetricName(metric.Key)
-
-	// Add entity type prefix if not project (for new metrics only)
 	if entityType != "project" {
-		metricName = "sonarqube_" + entityType + "_" + sanitizeMetricName(metric.Key)
+		metricName = "sonarqube_" + sanitizeMetricName(metric.Key) + "_" + entityType
 	}
 
 	// For backward compatibility, don't add type label to existing project metrics

@@ -27,7 +27,7 @@ func New(address string, collector *metrics.Collector) *Server {
 	registry.MustRegister(collector)
 
 	// Check if we're in async mode
-	isAsyncMode := collector != nil && collector.CacheReady() != nil
+	isAsyncMode := collector != nil && collector.IsAsyncMode()
 
 	// Create HTTP mux
 	mux := http.NewServeMux()
@@ -54,13 +54,16 @@ func New(address string, collector *metrics.Collector) *Server {
 		cacheReady = collector.CacheReady()
 	}
 
+	// WriteTimeout is intentionally 0 (disabled) because in sync mode the /metrics
+	// handler fetches all data from SonarQube before writing — this can take minutes
+	// on large instances. A fixed WriteTimeout would cut the connection before the
+	// response is sent. ReadTimeout still protects against slow/malicious clients.
 	return &Server{
 		httpServer: &http.Server{
-			Addr:         address,
-			Handler:      mux,
-			ReadTimeout:  15 * time.Second,
-			WriteTimeout: 15 * time.Second,
-			IdleTimeout:  60 * time.Second,
+			Addr:        address,
+			Handler:     mux,
+			ReadTimeout: 15 * time.Second,
+			IdleTimeout: 60 * time.Second,
 		},
 		registry:    registry,
 		collector:   collector,

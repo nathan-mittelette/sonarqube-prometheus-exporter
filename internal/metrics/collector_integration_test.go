@@ -494,7 +494,7 @@ func TestCollect_WithPullRequests(t *testing.T) {
 			if project == "project1" {
 				response := sonarqube.PullRequestsResponse{
 					PullRequests: []sonarqube.PullRequest{
-						{Key: "pr-1", Title: "Fix bug", Status: "OPEN", Branch: "feature", Target: "main"},
+						{Key: "pr-1", Title: "Fix bug", Status: sonarqube.PullRequestStatus{QualityGateStatus: "OK"}, Branch: "feature", Target: "main"},
 					},
 					Paging: sonarqube.Paging{
 						PageIndex: 1,
@@ -666,14 +666,14 @@ func TestGetProjectName(t *testing.T) {
 	collector := NewCollector(client, config)
 
 	// Initialize cache with projects
-	collector.cacheMu.Lock()
+	collector.mu.Lock()
 	collector.cache = &MetricsCache{
 		Projects: []sonarqube.Component{
 			{Key: "project1", Name: "Project 1"},
 			{Key: "project2", Name: "Project 2"},
 		},
 	}
-	collector.cacheMu.Unlock()
+	collector.mu.Unlock()
 
 	// Test getting existing project name
 	name := collector.getProjectName("project1")

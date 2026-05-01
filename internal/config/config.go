@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"strconv"
-	"strings"
 )
 
 // Config holds the application configuration
@@ -57,10 +56,15 @@ func LoadWithFlagSet(fs *flag.FlagSet, args []string) (*Config, error) {
 	return cfg, nil
 }
 
-// parseBoolEnv parses a boolean environment variable
+// parseBoolEnv parses a boolean environment variable.
+// Accepts "1", "t", "true", "yes", "on" (case-insensitive) as true values.
 func parseBoolEnv(key, defaultValue string) bool {
 	value := getEnv(key, defaultValue)
-	return strings.ToLower(value) == "true"
+	b, err := strconv.ParseBool(value)
+	if err != nil {
+		return false
+	}
+	return b
 }
 
 // parseIntEnv parses an integer environment variable

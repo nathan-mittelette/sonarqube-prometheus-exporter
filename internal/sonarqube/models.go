@@ -79,15 +79,21 @@ type BranchesResponse struct {
 	Paging   Paging   `json:"paging"`
 }
 
+// PullRequestStatus is the nested status object returned by the SonarQube API.
+// The API returns {"status": {"qualityGateStatus": "OK"}} rather than a plain string.
+type PullRequestStatus struct {
+	QualityGateStatus string `json:"qualityGateStatus"`
+}
+
 // PullRequest represents a SonarQube pull request
 type PullRequest struct {
-	Key         string `json:"key"`
-	Title       string `json:"title"`
-	Status      string `json:"status"`
-	ProjectKey  string `json:"projectKey,omitempty"`
-	ProjectName string `json:"projectName,omitempty"`
-	Branch      string `json:"branch,omitempty"`
-	Target      string `json:"target,omitempty"`
+	Key         string            `json:"key"`
+	Title       string            `json:"title"`
+	Status      PullRequestStatus `json:"status"`
+	ProjectKey  string            `json:"projectKey,omitempty"`
+	ProjectName string            `json:"projectName,omitempty"`
+	Branch      string            `json:"branch,omitempty"`
+	Target      string            `json:"base,omitempty"`
 }
 
 // PullRequestsResponse represents the response from /api/project_pull_requests/list

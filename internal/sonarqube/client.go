@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -121,9 +122,9 @@ func (c *Client) GetProjectMeasures(projectKey string, metricKeys []string) ([]M
 		metricsParam.WriteString(key)
 	}
 
-	url := fmt.Sprintf("%s/api/measures/component?component=%s&metricKeys=%s", c.baseURL, projectKey, metricsParam.String())
+	reqURL := fmt.Sprintf("%s/api/measures/component?component=%s&metricKeys=%s", c.baseURL, url.QueryEscape(projectKey), metricsParam.String())
 
-	req, err := http.NewRequest("GET", url, nil)
+	req, err := http.NewRequest("GET", reqURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
@@ -149,110 +150,74 @@ func (c *Client) GetProjectMeasures(projectKey string, metricKeys []string) ([]M
 	return measuresResp.Component.Measures, nil
 }
 
-// GetProjectBranches retrieves all branches for a specific project
+// GetProjectBranches retrieves all branches for a specific project.
+// The SonarQube /api/project_branches/list endpoint returns all branches in a single
+// response without pagination support, so no loop is needed.
 func (c *Client) GetProjectBranches(projectKey string) ([]Branch, error) {
-	var allBranches []Branch
-	pageIndex := 1
-	pageSize := 500
+	reqURL := fmt.Sprintf("%s/api/project_branches/list?project=%s", c.baseURL, url.QueryEscape(projectKey))
 
-	for {
-		url := fmt.Sprintf("%s/api/project_branches/list?project=%s&ps=%d&p=%d", c.baseURL, projectKey, pageSize, pageIndex)
-
-		req, err := http.NewRequest("GET", url, nil)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create request: %w", err)
-		}
-
-		req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", c.token))
-
-		resp, err := c.httpClient.Do(req)
-		if err != nil {
-			return nil, fmt.Errorf("failed to fetch branches: %w", err)
-		}
-
-		if resp.StatusCode != http.StatusOK {
-			body, _ := io.ReadAll(resp.Body)
-			resp.Body.Close()
-			// If project has no branches, return empty list
-			if resp.StatusCode == http.StatusNotFound {
-				return []Branch{}, nil
-			}
-			return nil, fmt.Errorf("unexpected status code %d: %s", resp.StatusCode, string(body))
-		}
-
-		var branchesResp BranchesResponse
-		if err := json.NewDecoder(resp.Body).Decode(&branchesResp); err != nil {
-			resp.Body.Close()
-			return nil, fmt.Errorf("failed to decode branches response: %w", err)
-		}
-
-		allBranches = append(allBranches, branchesResp.Branches...)
-
-		// Close response body after processing
-		resp.Body.Close()
-
-		// Check if we've retrieved all branches
-		if len(allBranches) >= branchesResp.Paging.Total {
-			break
-		}
-
-		pageIndex++
+	req, err := http.NewRequest("GET", reqURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 
-	return allBranches, nil
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", c.token))
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch branches: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode == http.StatusNotFound {
+			return []Branch{}, nil
+		}
+		return nil, fmt.Errorf("unexpected status code %d: %s", resp.StatusCode, string(body))
+	}
+
+	var branchesResp BranchesResponse
+	if err := json.NewDecoder(resp.Body).Decode(&branchesResp); err != nil {
+		return nil, fmt.Errorf("failed to decode branches response: %w", err)
+	}
+
+	return branchesResp.Branches, nil
 }
 
-// GetProjectPullRequests retrieves all pull requests for a specific project
+// GetProjectPullRequests retrieves all pull requests for a specific project.
+// The SonarQube /api/project_pull_requests/list endpoint returns all PRs in a single
+// response without pagination support, so no loop is needed.
 func (c *Client) GetProjectPullRequests(projectKey string) ([]PullRequest, error) {
-	var allPRs []PullRequest
-	pageIndex := 1
-	pageSize := 500
+	reqURL := fmt.Sprintf("%s/api/project_pull_requests/list?project=%s", c.baseURL, url.QueryEscape(projectKey))
 
-	for {
-		url := fmt.Sprintf("%s/api/project_pull_requests/list?project=%s&ps=%d&p=%d", c.baseURL, projectKey, pageSize, pageIndex)
-
-		req, err := http.NewRequest("GET", url, nil)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create request: %w", err)
-		}
-
-		req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", c.token))
-
-		resp, err := c.httpClient.Do(req)
-		if err != nil {
-			return nil, fmt.Errorf("failed to fetch pull requests: %w", err)
-		}
-
-		if resp.StatusCode != http.StatusOK {
-			body, _ := io.ReadAll(resp.Body)
-			resp.Body.Close()
-			// If project has no pull requests, return empty list
-			if resp.StatusCode == http.StatusNotFound {
-				return []PullRequest{}, nil
-			}
-			return nil, fmt.Errorf("unexpected status code %d: %s", resp.StatusCode, string(body))
-		}
-
-		var prsResp PullRequestsResponse
-		if err := json.NewDecoder(resp.Body).Decode(&prsResp); err != nil {
-			resp.Body.Close()
-			return nil, fmt.Errorf("failed to decode pull requests response: %w", err)
-		}
-
-		allPRs = append(allPRs, prsResp.PullRequests...)
-
-		// Close response body after processing
-		resp.Body.Close()
-
-		// Check if we've retrieved all pull requests
-		if len(allPRs) >= prsResp.Paging.Total {
-			break
-		}
-
-		pageIndex++
+	req, err := http.NewRequest("GET", reqURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 
-	return allPRs, nil
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", c.token))
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch pull requests: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode == http.StatusNotFound {
+			return []PullRequest{}, nil
+		}
+		return nil, fmt.Errorf("unexpected status code %d: %s", resp.StatusCode, string(body))
+	}
+
+	var prsResp PullRequestsResponse
+	if err := json.NewDecoder(resp.Body).Decode(&prsResp); err != nil {
+		return nil, fmt.Errorf("failed to decode pull requests response: %w", err)
+	}
+
+	return prsResp.PullRequests, nil
 }
 
 // GetBranchMeasures retrieves measures for a specific branch
@@ -271,9 +236,9 @@ func (c *Client) GetBranchMeasures(projectKey, branchName string, metricKeys []s
 	}
 
 	// Use branch query parameter instead of concatenating to component key
-	url := fmt.Sprintf("%s/api/measures/component?component=%s&metricKeys=%s&branch=%s", c.baseURL, projectKey, metricsParam.String(), branchName)
+	reqURL := fmt.Sprintf("%s/api/measures/component?component=%s&metricKeys=%s&branch=%s", c.baseURL, url.QueryEscape(projectKey), metricsParam.String(), url.QueryEscape(branchName))
 
-	req, err := http.NewRequest("GET", url, nil)
+	req, err := http.NewRequest("GET", reqURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
@@ -315,9 +280,9 @@ func (c *Client) GetPullRequestMeasures(projectKey, prKey string, metricKeys []s
 	}
 
 	// Use pullRequest query parameter instead of concatenating to component key
-	url := fmt.Sprintf("%s/api/measures/component?component=%s&metricKeys=%s&pullRequest=%s", c.baseURL, projectKey, metricsParam.String(), prKey)
+	reqURL := fmt.Sprintf("%s/api/measures/component?component=%s&metricKeys=%s&pullRequest=%s", c.baseURL, url.QueryEscape(projectKey), metricsParam.String(), url.QueryEscape(prKey))
 
-	req, err := http.NewRequest("GET", url, nil)
+	req, err := http.NewRequest("GET", reqURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
