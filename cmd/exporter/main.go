@@ -24,12 +24,20 @@ func main() {
 	log.Printf("Starting SonarQube Prometheus Exporter")
 	log.Printf("SonarQube URL: %s", cfg.SonarQubeURL)
 	log.Printf("Server address: %s", cfg.Address())
+	log.Printf("Collect branches: %v", cfg.CollectBranches)
+	log.Printf("Collect pull requests: %v", cfg.CollectPullRequests)
+	log.Printf("Refresh interval: %d seconds", cfg.RefreshInterval)
 
 	// Create SonarQube client
 	sqClient := sonarqube.NewClient(cfg.SonarQubeURL, cfg.SonarQubeToken)
 
-	// Create Prometheus collector
-	collector := metrics.NewCollector(sqClient)
+	// Create Prometheus collector with configuration
+	collectorConfig := metrics.Config{
+		CollectBranches:     cfg.CollectBranches,
+		CollectPullRequests: cfg.CollectPullRequests,
+		RefreshInterval:     time.Duration(cfg.RefreshInterval) * time.Second,
+	}
+	collector := metrics.NewCollector(sqClient, collectorConfig)
 
 	// Create HTTP server
 	srv := server.New(cfg.Address(), collector)
@@ -48,6 +56,11 @@ func main() {
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
+
+	// Stop async refresh before shutdown
+	if collectorConfig.RefreshInterval > 0 {
+		collector.StopAsyncRefresh()
+	}
 
 	// Graceful shutdown with timeout
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)

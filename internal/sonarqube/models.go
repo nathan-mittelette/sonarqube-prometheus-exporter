@@ -62,3 +62,42 @@ type Measure struct {
 	Metric string `json:"metric"`
 	Value  string `json:"value"`
 }
+
+// Branch represents a SonarQube branch
+type Branch struct {
+	Key         string `json:"key"`
+	Name        string `json:"name"`
+	IsMain      bool   `json:"isMain"`
+	Type        string `json:"type"`
+	ProjectKey  string `json:"projectKey,omitempty"`
+	ProjectName string `json:"projectName,omitempty"`
+}
+
+// BranchesResponse represents the response from /api/project_branches/list
+type BranchesResponse struct {
+	Branches []Branch `json:"branches"`
+	Paging   Paging   `json:"paging"`
+}
+
+// PullRequestStatus is the nested status object returned by the SonarQube API.
+// The API returns {"status": {"qualityGateStatus": "OK"}} rather than a plain string.
+type PullRequestStatus struct {
+	QualityGateStatus string `json:"qualityGateStatus"`
+}
+
+// PullRequest represents a SonarQube pull request
+type PullRequest struct {
+	Key         string            `json:"key"`
+	Title       string            `json:"title"`
+	Status      PullRequestStatus `json:"status"`
+	ProjectKey  string            `json:"projectKey,omitempty"`
+	ProjectName string            `json:"projectName,omitempty"`
+	Branch      string            `json:"branch,omitempty"`
+	Target      string            `json:"base,omitempty"`
+}
+
+// PullRequestsResponse represents the response from /api/project_pull_requests/list
+type PullRequestsResponse struct {
+	PullRequests []PullRequest `json:"pullRequests"`
+	Paging       Paging        `json:"paging"`
+}

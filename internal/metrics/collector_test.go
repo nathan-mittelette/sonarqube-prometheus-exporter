@@ -2,6 +2,7 @@ package metrics
 
 import (
 	"testing"
+	"time"
 
 	"github.com/axopen/sonarqube-prometheus-exporter/internal/sonarqube"
 	"github.com/prometheus/client_golang/prometheus"
@@ -172,7 +173,12 @@ func TestGetNumericMetricKeys(t *testing.T) {
 
 func TestNewCollector(t *testing.T) {
 	client := sonarqube.NewClient("https://sonar.example.com", "test-token")
-	collector := NewCollector(client)
+	config := Config{
+		CollectBranches:     false,
+		CollectPullRequests: false,
+		RefreshInterval:     0,
+	}
+	collector := NewCollector(client, config)
 
 	if collector == nil {
 		t.Fatal("Expected collector to be created, got nil")
@@ -191,9 +197,39 @@ func TestNewCollector(t *testing.T) {
 	}
 }
 
+func TestNewCollector_WithFeatures(t *testing.T) {
+	client := sonarqube.NewClient("https://sonar.example.com", "test-token")
+	config := Config{
+		CollectBranches:     true,
+		CollectPullRequests: true,
+		RefreshInterval:     time.Second * 30,
+	}
+	collector := NewCollector(client, config)
+
+	if collector == nil {
+		t.Fatal("Expected collector to be created, got nil")
+	}
+
+	if collector.branchInfo == nil {
+		t.Error("Expected branchInfo descriptor to be initialized")
+	}
+
+	if collector.pullRequestInfo == nil {
+		t.Error("Expected pullRequestInfo descriptor to be initialized")
+	}
+
+	// Cleanup async refresh
+	collector.StopAsyncRefresh()
+}
+
 func TestDescribe(t *testing.T) {
 	client := sonarqube.NewClient("https://sonar.example.com", "test-token")
-	collector := NewCollector(client)
+	config := Config{
+		CollectBranches:     false,
+		CollectPullRequests: false,
+		RefreshInterval:     0,
+	}
+	collector := NewCollector(client, config)
 
 	ch := make(chan *prometheus.Desc, 10)
 	go func() {
@@ -211,9 +247,41 @@ func TestDescribe(t *testing.T) {
 	}
 }
 
+func TestDescribe_WithFeatures(t *testing.T) {
+	client := sonarqube.NewClient("https://sonar.example.com", "test-token")
+	config := Config{
+		CollectBranches:     true,
+		CollectPullRequests: true,
+		RefreshInterval:     0,
+	}
+	collector := NewCollector(client, config)
+
+	ch := make(chan *prometheus.Desc, 10)
+	go func() {
+		collector.Describe(ch)
+		close(ch)
+	}()
+
+	count := 0
+	for range ch {
+		count++
+	}
+
+	// Should have project_info, branch_info, and pull_request_info descriptors
+	expectedCount := 3
+	if count != expectedCount {
+		t.Errorf("Expected %d descriptors, got: %d", expectedCount, count)
+	}
+}
+
 func TestGetOrCreateMetricDesc(t *testing.T) {
 	client := sonarqube.NewClient("https://sonar.example.com", "test-token")
-	collector := NewCollector(client)
+	config := Config{
+		CollectBranches:     false,
+		CollectPullRequests: false,
+		RefreshInterval:     0,
+	}
+	collector := NewCollector(client, config)
 
 	metric := &sonarqube.Metric{
 		Key:         "bugs",
@@ -223,13 +291,13 @@ func TestGetOrCreateMetricDesc(t *testing.T) {
 	}
 
 	// First call should create the descriptor
-	desc1 := collector.getOrCreateMetricDesc(metric)
+	desc1 := collector.getOrCreateMetricDesc(metric, "project")
 	if desc1 == nil {
 		t.Fatal("Expected descriptor to be created, got nil")
 	}
 
 	// Second call should return the cached descriptor
-	desc2 := collector.getOrCreateMetricDesc(metric)
+	desc2 := collector.getOrCreateMetricDesc(metric, "project")
 	if desc1 != desc2 {
 		t.Error("Expected cached descriptor to be returned")
 	}
@@ -240,9 +308,60 @@ func TestGetOrCreateMetricDesc(t *testing.T) {
 	}
 }
 
+func TestGetLabelNames(t *testing.T) {
+	client := sonarqube.NewClient("https://sonar.example.com", "test-token")
+	config := Config{
+		CollectBranches:     false,
+		CollectPullRequests: false,
+		RefreshInterval:     0,
+	}
+	collector := NewCollector(client, config)
+
+	tests := []struct {
+		entityType string
+		expected   []string
+	}{
+		{
+			entityType: "project",
+			expected:   []string{"project_key", "project_name"},
+		},
+		{
+			entityType: "branch",
+			expected:   []string{"project_key", "project_name", "branch_key"},
+		},
+		{
+			entityType: "pull_request",
+			expected:   []string{"project_key", "project_name", "pr_key"},
+		},
+		{
+			entityType: "unknown",
+			expected:   []string{"project_key", "project_name"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.entityType, func(t *testing.T) {
+			result := collector.getLabelNames(tt.entityType)
+			if len(result) != len(tt.expected) {
+				t.Errorf("Expected %d labels, got: %d", len(tt.expected), len(result))
+			}
+			for i, label := range result {
+				if label != tt.expected[i] {
+					t.Errorf("Expected label '%s', got: '%s'", tt.expected[i], label)
+				}
+			}
+		})
+	}
+}
+
 func TestExportMeasure(t *testing.T) {
 	client := sonarqube.NewClient("https://sonar.example.com", "test-token")
-	collector := NewCollector(client)
+	config := Config{
+		CollectBranches:     false,
+		CollectPullRequests: false,
+		RefreshInterval:     0,
+	}
+	collector := NewCollector(client, config)
 
 	allMetrics := []sonarqube.Metric{
 		{
@@ -260,7 +379,7 @@ func TestExportMeasure(t *testing.T) {
 	}
 
 	ch := make(chan prometheus.Metric, 10)
-	collector.exportMeasure(ch, "project1", "Project 1", measure, allMetrics)
+	collector.exportMeasure(ch, "project1", "Project 1", measure, allMetrics, "project")
 	close(ch)
 
 	count := 0
@@ -275,7 +394,12 @@ func TestExportMeasure(t *testing.T) {
 
 func TestExportMeasure_InvalidMetric(t *testing.T) {
 	client := sonarqube.NewClient("https://sonar.example.com", "test-token")
-	collector := NewCollector(client)
+	config := Config{
+		CollectBranches:     false,
+		CollectPullRequests: false,
+		RefreshInterval:     0,
+	}
+	collector := NewCollector(client, config)
 
 	allMetrics := []sonarqube.Metric{
 		{
@@ -294,7 +418,7 @@ func TestExportMeasure_InvalidMetric(t *testing.T) {
 	}
 
 	ch := make(chan prometheus.Metric, 10)
-	collector.exportMeasure(ch, "project1", "Project 1", measure, allMetrics)
+	collector.exportMeasure(ch, "project1", "Project 1", measure, allMetrics, "project")
 	close(ch)
 
 	count := 0
@@ -309,7 +433,12 @@ func TestExportMeasure_InvalidMetric(t *testing.T) {
 
 func TestExportMeasure_InvalidValue(t *testing.T) {
 	client := sonarqube.NewClient("https://sonar.example.com", "test-token")
-	collector := NewCollector(client)
+	config := Config{
+		CollectBranches:     false,
+		CollectPullRequests: false,
+		RefreshInterval:     0,
+	}
+	collector := NewCollector(client, config)
 
 	allMetrics := []sonarqube.Metric{
 		{
@@ -328,7 +457,7 @@ func TestExportMeasure_InvalidValue(t *testing.T) {
 	}
 
 	ch := make(chan prometheus.Metric, 10)
-	collector.exportMeasure(ch, "project1", "Project 1", measure, allMetrics)
+	collector.exportMeasure(ch, "project1", "Project 1", measure, allMetrics, "project")
 	close(ch)
 
 	count := 0
@@ -339,5 +468,81 @@ func TestExportMeasure_InvalidValue(t *testing.T) {
 	// Should not export metric with invalid value
 	if count != 0 {
 		t.Errorf("Expected 0 metrics to be exported for invalid value, got: %d", count)
+	}
+}
+
+func TestExportMeasure_WithBranch(t *testing.T) {
+	client := sonarqube.NewClient("https://sonar.example.com", "test-token")
+	config := Config{
+		CollectBranches:     true,
+		CollectPullRequests: false,
+		RefreshInterval:     0,
+	}
+	collector := NewCollector(client, config)
+
+	allMetrics := []sonarqube.Metric{
+		{
+			Key:         "bugs",
+			Type:        "INT",
+			Name:        "Bugs",
+			Description: "Number of bugs",
+			Domain:      "Reliability",
+		},
+	}
+
+	measure := sonarqube.Measure{
+		Metric: "bugs",
+		Value:  "5",
+	}
+
+	ch := make(chan prometheus.Metric, 10)
+	collector.exportMeasure(ch, "project1", "Project 1", measure, allMetrics, "branch", "main")
+	close(ch)
+
+	count := 0
+	for range ch {
+		count++
+	}
+
+	if count != 1 {
+		t.Errorf("Expected 1 metric to be exported for branch, got: %d", count)
+	}
+}
+
+func TestExportMeasure_WithPullRequest(t *testing.T) {
+	client := sonarqube.NewClient("https://sonar.example.com", "test-token")
+	config := Config{
+		CollectBranches:     false,
+		CollectPullRequests: true,
+		RefreshInterval:     0,
+	}
+	collector := NewCollector(client, config)
+
+	allMetrics := []sonarqube.Metric{
+		{
+			Key:         "bugs",
+			Type:        "INT",
+			Name:        "Bugs",
+			Description: "Number of bugs",
+			Domain:      "Reliability",
+		},
+	}
+
+	measure := sonarqube.Measure{
+		Metric: "bugs",
+		Value:  "3",
+	}
+
+	ch := make(chan prometheus.Metric, 10)
+	collector.exportMeasure(ch, "project1", "Project 1", measure, allMetrics, "pull_request", "pr-123")
+	close(ch)
+
+	count := 0
+	for range ch {
+		count++
+	}
+
+	if count != 1 {
+		t.Errorf("Expected 1 metric to be exported for pull request, got: %d", count)
 	}
 }

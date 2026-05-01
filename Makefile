@@ -14,10 +14,12 @@ build:
 # Run tests
 test:
 	@echo "Running tests..."
-	go test -v -race -coverprofile=coverage.out ./...
+	go test -v -race ./...
 
 # Run tests with coverage report
-coverage: test
+coverage:
+	@echo "Running tests with coverage..."
+	go test -v -race -coverprofile=coverage.out ./...
 	@echo "Generating coverage report..."
 	go tool cover -html=coverage.out -o coverage.html
 
