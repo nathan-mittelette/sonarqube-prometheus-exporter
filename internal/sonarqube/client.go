@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -108,15 +109,15 @@ func (c *Client) GetProjectMeasures(projectKey string, metricKeys []string) ([]M
 	}
 
 	// Build metric keys parameter
-	metricsParam := ""
+	var metricsParam strings.Builder
 	for i, key := range metricKeys {
 		if i > 0 {
-			metricsParam += ","
+			metricsParam.WriteString(",")
 		}
-		metricsParam += key
+		metricsParam.WriteString(key)
 	}
 
-	url := fmt.Sprintf("%s/api/measures/component?component=%s&metricKeys=%s", c.baseURL, projectKey, metricsParam)
+	url := fmt.Sprintf("%s/api/measures/component?component=%s&metricKeys=%s", c.baseURL, projectKey, metricsParam.String())
 
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
