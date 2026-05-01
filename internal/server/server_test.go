@@ -59,6 +59,51 @@ func TestHealthHandler(t *testing.T) {
 	}
 }
 
+func TestHealthHandlerAsync_CacheReady(t *testing.T) {
+	// Create a channel that's already closed (cache ready)
+	cacheReady := make(chan struct{})
+	close(cacheReady)
+
+	req := httptest.NewRequest("GET", "/health", nil)
+	w := httptest.NewRecorder()
+
+	healthHandlerAsync(w, req, cacheReady)
+
+	resp := w.Result()
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("Expected status code %d, got: %d", http.StatusOK, resp.StatusCode)
+	}
+
+	body := w.Body.String()
+	if body != "OK" {
+		t.Errorf("Expected body 'OK', got: %s", body)
+	}
+}
+
+func TestHealthHandlerAsync_CacheNotReady(t *testing.T) {
+	// Create a channel that's not closed (cache not ready)
+	cacheReady := make(chan struct{})
+
+	req := httptest.NewRequest("GET", "/health", nil)
+	w := httptest.NewRecorder()
+
+	healthHandlerAsync(w, req, cacheReady)
+
+	resp := w.Result()
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("Expected status code %d, got: %d", http.StatusServiceUnavailable, resp.StatusCode)
+	}
+
+	body := w.Body.String()
+	if body != "Cache not ready" {
+		t.Errorf("Expected body 'Cache not ready', got: %s", body)
+	}
+}
+
 func TestRootHandler(t *testing.T) {
 	req := httptest.NewRequest("GET", "/", nil)
 	w := httptest.NewRecorder()
@@ -138,6 +183,34 @@ func TestServerEndpoints(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestServerEndpoints_AsyncMode(t *testing.T) {
+	// Create a mock client that will fail (no real server)
+	// This tests that health returns 503 when cache is not ready
+	client := sonarqube.NewClient("https://sonar.example.com", "test-token")
+	config := metrics.Config{
+		CollectBranches:     false,
+		CollectPullRequests: false,
+		RefreshInterval:     time.Millisecond * 100,
+	}
+	collector := metrics.NewCollector(client, config)
+
+	srv := New("localhost:0", collector)
+
+	// In async mode with failing client, cache will never be ready
+	// Health should return 503
+	req := httptest.NewRequest("GET", "/health", nil)
+	w := httptest.NewRecorder()
+
+	srv.httpServer.Handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Errorf("Expected status code %d (cache not ready), got: %d", http.StatusServiceUnavailable, w.Code)
+	}
+
+	// Cleanup
+	collector.StopAsyncRefresh()
 }
 
 func TestServerShutdown(t *testing.T) {

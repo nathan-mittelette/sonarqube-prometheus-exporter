@@ -31,6 +31,7 @@ type Collector struct {
 	lastRefreshTime     time.Time
 	lastRefreshError    error
 	lastRefreshDuration time.Duration
+	cacheReady          chan struct{} // Closed when first cache population is complete
 }
 
 // Config holds collector configuration
@@ -84,11 +85,15 @@ func NewCollector(client *sonarqube.Client, cfg Config) *Collector {
 			PullRequests:    make(map[string][]sonarqube.PullRequest),
 			PRMeasures:      make(map[string]map[string][]sonarqube.Measure),
 		},
+		cacheReady: make(chan struct{}),
 	}
 
 	// Start async refresh if interval is configured
 	if cfg.RefreshInterval > 0 {
 		c.StartAsyncRefresh()
+	} else {
+		// In sync mode, cache is always ready
+		close(c.cacheReady)
 	}
 
 	return c
@@ -107,6 +112,11 @@ func (c *Collector) StopAsyncRefresh() {
 		c.refreshCancel()
 		c.refreshWg.Wait()
 	}
+}
+
+// CacheReady returns a channel that is closed when the cache is first populated
+func (c *Collector) CacheReady() <-chan struct{} {
+	return c.cacheReady
 }
 
 // refreshLoop runs the background refresh loop
@@ -146,6 +156,9 @@ func (c *Collector) refreshMetrics() {
 		LastUpdated:     startTime,
 	}
 
+	// Use a mutex to protect concurrent writes to newCache
+	var newCacheMu sync.Mutex
+
 	// Fetch metrics
 	metrics, err := c.client.GetMetrics()
 	if err != nil {
@@ -171,7 +184,7 @@ func (c *Collector) refreshMetrics() {
 	}
 	newCache.Projects = projects
 
-	// Fetch project measures
+	// Fetch project measures with proper synchronization
 	var wg sync.WaitGroup
 	for _, project := range projects {
 		wg.Add(1)
@@ -182,7 +195,11 @@ func (c *Collector) refreshMetrics() {
 				log.Printf("Error fetching measures for project %s: %v", p.Key, err)
 				return
 			}
+
+			// Safe write to newCache
+			newCacheMu.Lock()
 			newCache.ProjectMeasures[p.Key] = measures
+			newCacheMu.Unlock()
 		}(project)
 	}
 
@@ -197,10 +214,13 @@ func (c *Collector) refreshMetrics() {
 					log.Printf("Error fetching branches for project %s: %v", p.Key, err)
 					return
 				}
-				newCache.Branches[p.Key] = branches
 
+				// Safe write to newCache
+				newCacheMu.Lock()
+				newCache.Branches[p.Key] = branches
 				// Initialize branch measures map
 				newCache.BranchMeasures[p.Key] = make(map[string][]sonarqube.Measure)
+				newCacheMu.Unlock()
 
 				// Fetch measures for each branch
 				for _, branch := range branches {
@@ -212,7 +232,14 @@ func (c *Collector) refreshMetrics() {
 							log.Printf("Error fetching measures for branch %s:%s: %v", projectKey, b.Key, err)
 							return
 						}
+
+						// Safe write to nested map
+						newCacheMu.Lock()
+						if _, exists := newCache.BranchMeasures[projectKey]; !exists {
+							newCache.BranchMeasures[projectKey] = make(map[string][]sonarqube.Measure)
+						}
 						newCache.BranchMeasures[projectKey][b.Key] = measures
+						newCacheMu.Unlock()
 					}(p.Key, branch)
 				}
 			}(project)
@@ -230,10 +257,13 @@ func (c *Collector) refreshMetrics() {
 					log.Printf("Error fetching pull requests for project %s: %v", p.Key, err)
 					return
 				}
-				newCache.PullRequests[p.Key] = prs
 
+				// Safe write to newCache
+				newCacheMu.Lock()
+				newCache.PullRequests[p.Key] = prs
 				// Initialize PR measures map
 				newCache.PRMeasures[p.Key] = make(map[string][]sonarqube.Measure)
+				newCacheMu.Unlock()
 
 				// Fetch measures for each pull request
 				for _, pr := range prs {
@@ -245,7 +275,14 @@ func (c *Collector) refreshMetrics() {
 							log.Printf("Error fetching measures for pull request %s:%s: %v", projectKey, pr.Key, err)
 							return
 						}
+
+						// Safe write to nested map
+						newCacheMu.Lock()
+						if _, exists := newCache.PRMeasures[projectKey]; !exists {
+							newCache.PRMeasures[projectKey] = make(map[string][]sonarqube.Measure)
+						}
 						newCache.PRMeasures[projectKey][pr.Key] = measures
+						newCacheMu.Unlock()
 					}(p.Key, pr)
 				}
 			}(project)
@@ -262,6 +299,14 @@ func (c *Collector) refreshMetrics() {
 	c.lastRefreshDuration = time.Since(startTime)
 	c.lastRefreshTime = startTime
 	c.cacheMu.Unlock()
+
+	// Close cacheReady channel on first successful population
+	select {
+	case <-c.cacheReady:
+		// Already closed, first population already done
+	default:
+		close(c.cacheReady)
+	}
 
 	log.Printf("Metrics cache refreshed successfully in %v", c.lastRefreshDuration)
 }
@@ -597,7 +642,13 @@ func (c *Collector) exportMeasure(ch chan<- prometheus.Metric, projectKey, proje
 
 // getOrCreateMetricDesc gets or creates a Prometheus metric descriptor
 func (c *Collector) getOrCreateMetricDesc(metric *sonarqube.Metric, entityType string) *prometheus.Desc {
-	key := metric.Key + "_" + entityType
+	key := metric.Key
+
+	// For backward compatibility, don't include entityType in the key for project metrics
+	// This ensures existing metrics keep the same descriptor
+	if entityType != "project" {
+		key = metric.Key + "_" + entityType
+	}
 
 	if desc, exists := c.metricDescs[key]; exists {
 		return desc
@@ -606,16 +657,24 @@ func (c *Collector) getOrCreateMetricDesc(metric *sonarqube.Metric, entityType s
 	// Sanitize metric name for Prometheus
 	metricName := "sonarqube_" + sanitizeMetricName(metric.Key)
 
-	// Add entity type prefix if not project
+	// Add entity type prefix if not project (for new metrics only)
 	if entityType != "project" {
 		metricName = "sonarqube_" + entityType + "_" + sanitizeMetricName(metric.Key)
+	}
+
+	// For backward compatibility, don't add type label to existing project metrics
+	var constantLabels prometheus.Labels
+	if entityType == "project" {
+		constantLabels = prometheus.Labels{"domain": metric.Domain}
+	} else {
+		constantLabels = prometheus.Labels{"domain": metric.Domain, "type": entityType}
 	}
 
 	desc := prometheus.NewDesc(
 		metricName,
 		metric.Description,
 		c.getLabelNames(entityType),
-		prometheus.Labels{"domain": metric.Domain, "type": entityType},
+		constantLabels,
 	)
 
 	c.metricDescs[key] = desc
