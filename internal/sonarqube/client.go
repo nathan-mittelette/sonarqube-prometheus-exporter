@@ -77,19 +77,23 @@ func (c *Client) GetProjects() ([]Component, error) {
 		if err != nil {
 			return nil, fmt.Errorf("failed to fetch projects: %w", err)
 		}
-		defer resp.Body.Close()
 
 		if resp.StatusCode != http.StatusOK {
 			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
 			return nil, fmt.Errorf("unexpected status code %d: %s", resp.StatusCode, string(body))
 		}
 
 		var componentsResp ComponentsResponse
 		if err := json.NewDecoder(resp.Body).Decode(&componentsResp); err != nil {
+			resp.Body.Close()
 			return nil, fmt.Errorf("failed to decode components response: %w", err)
 		}
 
 		allComponents = append(allComponents, componentsResp.Components...)
+
+		// Close response body after processing
+		resp.Body.Close()
 
 		// Check if we've retrieved all projects
 		if len(allComponents) >= componentsResp.Paging.Total {
@@ -165,10 +169,10 @@ func (c *Client) GetProjectBranches(projectKey string) ([]Branch, error) {
 		if err != nil {
 			return nil, fmt.Errorf("failed to fetch branches: %w", err)
 		}
-		defer resp.Body.Close()
 
 		if resp.StatusCode != http.StatusOK {
 			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
 			// If project has no branches, return empty list
 			if resp.StatusCode == http.StatusNotFound {
 				return []Branch{}, nil
@@ -178,10 +182,14 @@ func (c *Client) GetProjectBranches(projectKey string) ([]Branch, error) {
 
 		var branchesResp BranchesResponse
 		if err := json.NewDecoder(resp.Body).Decode(&branchesResp); err != nil {
+			resp.Body.Close()
 			return nil, fmt.Errorf("failed to decode branches response: %w", err)
 		}
 
 		allBranches = append(allBranches, branchesResp.Branches...)
+
+		// Close response body after processing
+		resp.Body.Close()
 
 		// Check if we've retrieved all branches
 		if len(allBranches) >= branchesResp.Paging.Total {
@@ -214,10 +222,10 @@ func (c *Client) GetProjectPullRequests(projectKey string) ([]PullRequest, error
 		if err != nil {
 			return nil, fmt.Errorf("failed to fetch pull requests: %w", err)
 		}
-		defer resp.Body.Close()
 
 		if resp.StatusCode != http.StatusOK {
 			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
 			// If project has no pull requests, return empty list
 			if resp.StatusCode == http.StatusNotFound {
 				return []PullRequest{}, nil
@@ -227,10 +235,14 @@ func (c *Client) GetProjectPullRequests(projectKey string) ([]PullRequest, error
 
 		var prsResp PullRequestsResponse
 		if err := json.NewDecoder(resp.Body).Decode(&prsResp); err != nil {
+			resp.Body.Close()
 			return nil, fmt.Errorf("failed to decode pull requests response: %w", err)
 		}
 
 		allPRs = append(allPRs, prsResp.PullRequests...)
+
+		// Close response body after processing
+		resp.Body.Close()
 
 		// Check if we've retrieved all pull requests
 		if len(allPRs) >= prsResp.Paging.Total {
@@ -258,7 +270,8 @@ func (c *Client) GetBranchMeasures(projectKey, branchName string, metricKeys []s
 		metricsParam.WriteString(key)
 	}
 
-	url := fmt.Sprintf("%s/api/measures/component?component=%s:%s&metricKeys=%s", c.baseURL, projectKey, branchName, metricsParam.String())
+	// Use branch query parameter instead of concatenating to component key
+	url := fmt.Sprintf("%s/api/measures/component?component=%s&metricKeys=%s&branch=%s", c.baseURL, projectKey, metricsParam.String(), branchName)
 
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
@@ -301,7 +314,8 @@ func (c *Client) GetPullRequestMeasures(projectKey, prKey string, metricKeys []s
 		metricsParam.WriteString(key)
 	}
 
-	url := fmt.Sprintf("%s/api/measures/component?component=%s:%s&metricKeys=%s", c.baseURL, projectKey, prKey, metricsParam.String())
+	// Use pullRequest query parameter instead of concatenating to component key
+	url := fmt.Sprintf("%s/api/measures/component?component=%s&metricKeys=%s&pullRequest=%s", c.baseURL, projectKey, metricsParam.String(), prKey)
 
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {

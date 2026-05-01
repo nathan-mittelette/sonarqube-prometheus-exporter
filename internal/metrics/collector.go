@@ -74,7 +74,7 @@ func NewCollector(client *sonarqube.Client, cfg Config) *Collector {
 		pullRequestInfo: prometheus.NewDesc(
 			"sonarqube_pull_request_info",
 			"Information about SonarQube pull requests",
-			[]string{"project_key", "project_name", "pr_key", "pr_title", "pr_status", "pr_branch", "pr_target"},
+			[]string{"project_key", "project_name", "pr_key", "pr_status", "pr_branch", "pr_target"},
 			nil,
 		),
 		metricDescs: make(map[string]*prometheus.Desc),
@@ -329,7 +329,16 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 
 	// If async refresh is enabled, use cached data
 	if c.config.RefreshInterval > 0 {
-		c.collectFromCache(ch)
+		// Check if cache is ready
+		select {
+		case <-c.cacheReady:
+			// Cache is populated, serve from cache
+			c.collectFromCache(ch)
+		default:
+			// Cache not ready yet, fall back to synchronous collection
+			// This ensures metrics are available even during initial startup
+			c.collectSync(ch)
+		}
 		return
 	}
 
@@ -407,6 +416,7 @@ func (c *Collector) collectFromCache(ch chan<- prometheus.Metric) {
 			projectName := c.getProjectName(projectKey)
 			for _, pr := range prs {
 				// Export pull request info metric
+				// Note: pr.Title is omitted from labels to avoid high cardinality
 				ch <- prometheus.MustNewConstMetric(
 					c.pullRequestInfo,
 					prometheus.GaugeValue,
@@ -414,7 +424,6 @@ func (c *Collector) collectFromCache(ch chan<- prometheus.Metric) {
 					projectKey,
 					projectName,
 					pr.Key,
-					pr.Title,
 					pr.Status,
 					pr.Branch,
 					pr.Target,
@@ -524,6 +533,7 @@ func (c *Collector) collectSync(ch chan<- prometheus.Metric) {
 			} else {
 				for _, pr := range prs {
 					// Export pull request info metric
+					// Note: pr.Title is omitted from labels to avoid high cardinality
 					ch <- prometheus.MustNewConstMetric(
 						c.pullRequestInfo,
 						prometheus.GaugeValue,
@@ -531,7 +541,6 @@ func (c *Collector) collectSync(ch chan<- prometheus.Metric) {
 						project.Key,
 						project.Name,
 						pr.Key,
-						pr.Title,
 						pr.Status,
 						pr.Branch,
 						pr.Target,

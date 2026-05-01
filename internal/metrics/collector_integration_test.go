@@ -617,29 +617,38 @@ func TestCollect_AsyncMode(t *testing.T) {
 	}
 	collector := NewCollector(client, config)
 
-	// Wait for initial refresh to complete
-	time.Sleep(time.Millisecond * 200)
-
-	// Collect metrics (should use cached data)
-	ch := make(chan prometheus.Metric, 100)
-	go func() {
-		collector.Collect(ch)
-		close(ch)
-	}()
-
-	// Count collected metrics
-	count := 0
-	for range ch {
-		count++
-	}
-
+	// Wait for the async refresh to populate the cache by polling until the
+	// expected metrics become available, with a deadline to avoid hanging.
 	// Expected metrics:
 	// - 1 project_info metric
 	// - 1 project bugs metric
 	// Total: 2 metrics
 	expectedCount := 2
-	if count != expectedCount {
-		t.Errorf("Expected %d metrics, got: %d", expectedCount, count)
+	deadline := time.Now().Add(2 * time.Second)
+	pollInterval := 10 * time.Millisecond
+
+	count := 0
+	for {
+		ch := make(chan prometheus.Metric, 100)
+		go func() {
+			collector.Collect(ch)
+			close(ch)
+		}()
+
+		count = 0
+		for range ch {
+			count++
+		}
+
+		if count == expectedCount {
+			break
+		}
+
+		if time.Now().After(deadline) {
+			t.Fatalf("Timed out waiting for async refresh: expected %d metrics, got %d", expectedCount, count)
+		}
+
+		time.Sleep(pollInterval)
 	}
 
 	// Cleanup
