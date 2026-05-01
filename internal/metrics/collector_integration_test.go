@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/axopen/sonarqube-prometheus-exporter/internal/sonarqube"
 	"github.com/prometheus/client_golang/prometheus"
@@ -102,7 +103,12 @@ func TestCollect_Integration(t *testing.T) {
 
 	// Create client and collector
 	client := sonarqube.NewClient(server.URL, "test-token")
-	collector := NewCollector(client)
+	config := Config{
+		CollectBranches:     false,
+		CollectPullRequests: false,
+		RefreshInterval:     0,
+	}
+	collector := NewCollector(client, config)
 
 	// Collect metrics
 	ch := make(chan prometheus.Metric, 100)
@@ -141,7 +147,12 @@ func TestCollect_MetricsError(t *testing.T) {
 	defer server.Close()
 
 	client := sonarqube.NewClient(server.URL, "invalid-token")
-	collector := NewCollector(client)
+	config := Config{
+		CollectBranches:     false,
+		CollectPullRequests: false,
+		RefreshInterval:     0,
+	}
+	collector := NewCollector(client, config)
 
 	ch := make(chan prometheus.Metric, 100)
 	go func() {
@@ -187,7 +198,12 @@ func TestCollect_ProjectsError(t *testing.T) {
 	defer server.Close()
 
 	client := sonarqube.NewClient(server.URL, "test-token")
-	collector := NewCollector(client)
+	config := Config{
+		CollectBranches:     false,
+		CollectPullRequests: false,
+		RefreshInterval:     0,
+	}
+	collector := NewCollector(client, config)
 
 	ch := make(chan prometheus.Metric, 100)
 	go func() {
@@ -257,7 +273,12 @@ func TestCollect_MeasuresError(t *testing.T) {
 	defer server.Close()
 
 	client := sonarqube.NewClient(server.URL, "test-token")
-	collector := NewCollector(client)
+	config := Config{
+		CollectBranches:     false,
+		CollectPullRequests: false,
+		RefreshInterval:     0,
+	}
+	collector := NewCollector(client, config)
 
 	ch := make(chan prometheus.Metric, 100)
 	go func() {
@@ -275,4 +296,388 @@ func TestCollect_MeasuresError(t *testing.T) {
 	if count != 1 {
 		t.Errorf("Expected 1 metric (project_info), got: %d", count)
 	}
+}
+
+// TestCollect_WithBranches tests Collect with branch collection enabled
+func TestCollect_WithBranches(t *testing.T) {
+	// Create mock SonarQube server
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		switch r.URL.Path {
+		case "/api/metrics/search":
+			response := sonarqube.MetricsResponse{
+				Metrics: []sonarqube.Metric{
+					{
+						ID:          "1",
+						Key:         "bugs",
+						Type:        "INT",
+						Name:        "Bugs",
+						Description: "Number of bugs",
+						Domain:      "Reliability",
+						Hidden:      false,
+					},
+				},
+				Total: 1,
+			}
+			json.NewEncoder(w).Encode(response)
+
+		case "/api/components/search_projects":
+			response := sonarqube.ComponentsResponse{
+				Paging: sonarqube.Paging{
+					PageIndex: 1,
+					PageSize:  500,
+					Total:     1,
+				},
+				Components: []sonarqube.Component{
+					{
+						Key:        "project1",
+						Name:       "Project 1",
+						Qualifier:  "TRK",
+						Visibility: "private",
+					},
+				},
+			}
+			json.NewEncoder(w).Encode(response)
+
+		case "/api/measures/component":
+			component := r.URL.Query().Get("component")
+			var measures []sonarqube.Measure
+
+			if component == "project1" {
+				measures = []sonarqube.Measure{
+					{Metric: "bugs", Value: "5"},
+				}
+			} else if component == "project1:main" {
+				measures = []sonarqube.Measure{
+					{Metric: "bugs", Value: "2"},
+				}
+			} else if component == "project1:feature" {
+				measures = []sonarqube.Measure{
+					{Metric: "bugs", Value: "1"},
+				}
+			}
+
+			response := sonarqube.MeasuresResponse{
+				Component: sonarqube.ComponentMeasures{
+					Key:      component,
+					Name:     "Test Project",
+					Measures: measures,
+				},
+			}
+			json.NewEncoder(w).Encode(response)
+
+		case "/api/project_branches/list":
+			project := r.URL.Query().Get("project")
+			if project == "project1" {
+				response := sonarqube.BranchesResponse{
+					Branches: []sonarqube.Branch{
+						{Key: "main", Name: "main", IsMain: true, Type: "BRANCH"},
+						{Key: "feature", Name: "feature", IsMain: false, Type: "BRANCH"},
+					},
+					Paging: sonarqube.Paging{
+						PageIndex: 1,
+						PageSize:  500,
+						Total:     2,
+					},
+				}
+				json.NewEncoder(w).Encode(response)
+			}
+
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	// Create client and collector with branch collection enabled
+	client := sonarqube.NewClient(server.URL, "test-token")
+	config := Config{
+		CollectBranches:     true,
+		CollectPullRequests: false,
+		RefreshInterval:     0,
+	}
+	collector := NewCollector(client, config)
+
+	// Collect metrics
+	ch := make(chan prometheus.Metric, 100)
+	go func() {
+		collector.Collect(ch)
+		close(ch)
+	}()
+
+	// Count collected metrics
+	count := 0
+	for range ch {
+		count++
+	}
+
+	// Expected metrics:
+	// - 1 project_info metric
+	// - 1 project bugs metric
+	// - 2 branch_info metrics (main and feature)
+	// - 2 branch bugs metrics (main and feature)
+	// Total: 6 metrics
+	expectedCount := 6
+	if count != expectedCount {
+		t.Errorf("Expected %d metrics, got: %d", expectedCount, count)
+	}
+}
+
+// TestCollect_WithPullRequests tests Collect with pull request collection enabled
+func TestCollect_WithPullRequests(t *testing.T) {
+	// Create mock SonarQube server
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		switch r.URL.Path {
+		case "/api/metrics/search":
+			response := sonarqube.MetricsResponse{
+				Metrics: []sonarqube.Metric{
+					{
+						ID:          "1",
+						Key:         "bugs",
+						Type:        "INT",
+						Name:        "Bugs",
+						Description: "Number of bugs",
+						Domain:      "Reliability",
+						Hidden:      false,
+					},
+				},
+				Total: 1,
+			}
+			json.NewEncoder(w).Encode(response)
+
+		case "/api/components/search_projects":
+			response := sonarqube.ComponentsResponse{
+				Paging: sonarqube.Paging{
+					PageIndex: 1,
+					PageSize:  500,
+					Total:     1,
+				},
+				Components: []sonarqube.Component{
+					{
+						Key:        "project1",
+						Name:       "Project 1",
+						Qualifier:  "TRK",
+						Visibility: "private",
+					},
+				},
+			}
+			json.NewEncoder(w).Encode(response)
+
+		case "/api/measures/component":
+			component := r.URL.Query().Get("component")
+			var measures []sonarqube.Measure
+
+			if component == "project1" {
+				measures = []sonarqube.Measure{
+					{Metric: "bugs", Value: "5"},
+				}
+			} else if component == "project1:pr-1" {
+				measures = []sonarqube.Measure{
+					{Metric: "bugs", Value: "0"},
+				}
+			}
+
+			response := sonarqube.MeasuresResponse{
+				Component: sonarqube.ComponentMeasures{
+					Key:      component,
+					Name:     "Test Project",
+					Measures: measures,
+				},
+			}
+			json.NewEncoder(w).Encode(response)
+
+		case "/api/project_pull_requests/list":
+			project := r.URL.Query().Get("project")
+			if project == "project1" {
+				response := sonarqube.PullRequestsResponse{
+					PullRequests: []sonarqube.PullRequest{
+						{Key: "pr-1", Title: "Fix bug", Status: "OPEN", Branch: "feature", Target: "main"},
+					},
+					Paging: sonarqube.Paging{
+						PageIndex: 1,
+						PageSize:  500,
+						Total:     1,
+					},
+				}
+				json.NewEncoder(w).Encode(response)
+			}
+
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	// Create client and collector with pull request collection enabled
+	client := sonarqube.NewClient(server.URL, "test-token")
+	config := Config{
+		CollectBranches:     false,
+		CollectPullRequests: true,
+		RefreshInterval:     0,
+	}
+	collector := NewCollector(client, config)
+
+	// Collect metrics
+	ch := make(chan prometheus.Metric, 100)
+	go func() {
+		collector.Collect(ch)
+		close(ch)
+	}()
+
+	// Count collected metrics
+	count := 0
+	for range ch {
+		count++
+	}
+
+	// Expected metrics:
+	// - 1 project_info metric
+	// - 1 project bugs metric
+	// - 1 pull_request_info metric
+	// - 1 pull request bugs metric
+	// Total: 4 metrics
+	expectedCount := 4
+	if count != expectedCount {
+		t.Errorf("Expected %d metrics, got: %d", expectedCount, count)
+	}
+}
+
+// TestCollect_AsyncMode tests Collect in async mode
+func TestCollect_AsyncMode(t *testing.T) {
+	// Create mock SonarQube server
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		switch r.URL.Path {
+		case "/api/metrics/search":
+			response := sonarqube.MetricsResponse{
+				Metrics: []sonarqube.Metric{
+					{
+						ID:          "1",
+						Key:         "bugs",
+						Type:        "INT",
+						Name:        "Bugs",
+						Description: "Number of bugs",
+						Domain:      "Reliability",
+						Hidden:      false,
+					},
+				},
+				Total: 1,
+			}
+			json.NewEncoder(w).Encode(response)
+
+		case "/api/components/search_projects":
+			response := sonarqube.ComponentsResponse{
+				Paging: sonarqube.Paging{
+					PageIndex: 1,
+					PageSize:  500,
+					Total:     1,
+				},
+				Components: []sonarqube.Component{
+					{
+						Key:        "project1",
+						Name:       "Project 1",
+						Qualifier:  "TRK",
+						Visibility: "private",
+					},
+				},
+			}
+			json.NewEncoder(w).Encode(response)
+
+		case "/api/measures/component":
+			component := r.URL.Query().Get("component")
+			measures := []sonarqube.Measure{
+				{Metric: "bugs", Value: "5"},
+			}
+
+			response := sonarqube.MeasuresResponse{
+				Component: sonarqube.ComponentMeasures{
+					Key:      component,
+					Name:     "Test Project",
+					Measures: measures,
+				},
+			}
+			json.NewEncoder(w).Encode(response)
+
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	// Create client and collector with async mode enabled
+	client := sonarqube.NewClient(server.URL, "test-token")
+	config := Config{
+		CollectBranches:     false,
+		CollectPullRequests: false,
+		RefreshInterval:     time.Millisecond * 100, // Short interval for testing
+	}
+	collector := NewCollector(client, config)
+
+	// Wait for initial refresh to complete
+	time.Sleep(time.Millisecond * 200)
+
+	// Collect metrics (should use cached data)
+	ch := make(chan prometheus.Metric, 100)
+	go func() {
+		collector.Collect(ch)
+		close(ch)
+	}()
+
+	// Count collected metrics
+	count := 0
+	for range ch {
+		count++
+	}
+
+	// Expected metrics:
+	// - 1 project_info metric
+	// - 1 project bugs metric
+	// Total: 2 metrics
+	expectedCount := 2
+	if count != expectedCount {
+		t.Errorf("Expected %d metrics, got: %d", expectedCount, count)
+	}
+
+	// Cleanup
+	collector.StopAsyncRefresh()
+}
+
+// TestGetProjectName tests the getProjectName helper
+func TestGetProjectName(t *testing.T) {
+	client := sonarqube.NewClient("https://sonar.example.com", "test-token")
+	config := Config{
+		CollectBranches:     false,
+		CollectPullRequests: false,
+		RefreshInterval:     time.Second * 30,
+	}
+	collector := NewCollector(client, config)
+
+	// Initialize cache with projects
+	collector.cacheMu.Lock()
+	collector.cache = &MetricsCache{
+		Projects: []sonarqube.Component{
+			{Key: "project1", Name: "Project 1"},
+			{Key: "project2", Name: "Project 2"},
+		},
+	}
+	collector.cacheMu.Unlock()
+
+	// Test getting existing project name
+	name := collector.getProjectName("project1")
+	if name != "Project 1" {
+		t.Errorf("Expected 'Project 1', got: '%s'", name)
+	}
+
+	// Test getting non-existent project name (should return key)
+	name = collector.getProjectName("unknown")
+	if name != "unknown" {
+		t.Errorf("Expected 'unknown', got: '%s'", name)
+	}
+
+	// Cleanup
+	collector.StopAsyncRefresh()
 }

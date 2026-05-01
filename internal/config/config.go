@@ -4,6 +4,8 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strconv"
+	"strings"
 )
 
 // Config holds the application configuration
@@ -15,6 +17,11 @@ type Config struct {
 	// SonarQube configuration
 	SonarQubeURL   string
 	SonarQubeToken string
+
+	// Feature flags
+	CollectBranches     bool
+	CollectPullRequests bool
+	RefreshInterval     int // in seconds, 0 means disabled (sync mode)
 }
 
 // Load loads configuration from environment variables and CLI flags
@@ -31,6 +38,9 @@ func LoadWithFlagSet(fs *flag.FlagSet, args []string) (*Config, error) {
 	fs.StringVar(&cfg.Port, "port", getEnv("EXPORTER_PORT", "9090"), "Port to bind the exporter server")
 	fs.StringVar(&cfg.SonarQubeURL, "sonarqube-url", getEnv("SONARQUBE_URL", ""), "SonarQube server URL")
 	fs.StringVar(&cfg.SonarQubeToken, "sonarqube-token", getEnv("SONARQUBE_TOKEN", ""), "SonarQube authentication token")
+	fs.BoolVar(&cfg.CollectBranches, "collect-branches", parseBoolEnv("COLLECT_BRANCHES", "false"), "Enable collection of branch metrics")
+	fs.BoolVar(&cfg.CollectPullRequests, "collect-pull-requests", parseBoolEnv("COLLECT_PULL_REQUESTS", "false"), "Enable collection of pull request metrics")
+	fs.IntVar(&cfg.RefreshInterval, "refresh-interval", parseIntEnv("REFRESH_INTERVAL", "0"), "Refresh interval in seconds for async collection (0 = disabled, sync mode)")
 
 	if err := fs.Parse(args); err != nil {
 		return nil, err
@@ -45,6 +55,22 @@ func LoadWithFlagSet(fs *flag.FlagSet, args []string) (*Config, error) {
 	}
 
 	return cfg, nil
+}
+
+// parseBoolEnv parses a boolean environment variable
+func parseBoolEnv(key, defaultValue string) bool {
+	value := getEnv(key, defaultValue)
+	return strings.ToLower(value) == "true"
+}
+
+// parseIntEnv parses an integer environment variable
+func parseIntEnv(key, defaultValue string) int {
+	value := getEnv(key, defaultValue)
+	i, err := strconv.Atoi(value)
+	if err != nil {
+		return 0
+	}
+	return i
 }
 
 // getEnv returns the value of an environment variable or a default value

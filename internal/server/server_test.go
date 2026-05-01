@@ -14,7 +14,12 @@ import (
 
 func TestNew(t *testing.T) {
 	client := sonarqube.NewClient("https://sonar.example.com", "test-token")
-	collector := metrics.NewCollector(client)
+	config := metrics.Config{
+		CollectBranches:     false,
+		CollectPullRequests: false,
+		RefreshInterval:     0,
+	}
+	collector := metrics.NewCollector(client, config)
 
 	srv := New("localhost:9090", collector)
 
@@ -90,7 +95,12 @@ func TestRootHandler(t *testing.T) {
 
 func TestServerEndpoints(t *testing.T) {
 	client := sonarqube.NewClient("https://sonar.example.com", "test-token")
-	collector := metrics.NewCollector(client)
+	config := metrics.Config{
+		CollectBranches:     false,
+		CollectPullRequests: false,
+		RefreshInterval:     0,
+	}
+	collector := metrics.NewCollector(client, config)
 
 	srv := New("localhost:0", collector)
 
@@ -132,7 +142,12 @@ func TestServerEndpoints(t *testing.T) {
 
 func TestServerShutdown(t *testing.T) {
 	client := sonarqube.NewClient("https://sonar.example.com", "test-token")
-	collector := metrics.NewCollector(client)
+	config := metrics.Config{
+		CollectBranches:     false,
+		CollectPullRequests: false,
+		RefreshInterval:     0,
+	}
+	collector := metrics.NewCollector(client, config)
 
 	srv := New("localhost:0", collector)
 
